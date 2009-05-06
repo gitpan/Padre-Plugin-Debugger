@@ -14,13 +14,14 @@ use warnings;
 
 use File::Basename qw(fileparse);
 use File::Spec::Functions qw(catfile);
+use YAML;
 
 use Padre::Wx;
 use Padre::Plugin;
 
 use parent qw(Padre::Plugin);
 
-our $VERSION = "0.0_1";
+our $VERSION = "0.1";
 
 # -- Padre API, see Padre::Plugin
 
@@ -34,12 +35,20 @@ sub menu_plugins_simple {
     my $self = shift;
     return $self->plugin_name => [
         "About" => sub { $self->show_about },
-        "Run debugger" => sub { $self->start_debugger },
+        "Start debugger" => sub { $self->start_debugger },
         "Stop debugger" => sub { $self->stop_debugger },
-        "Step\tShift+Alt+S" => sub { $self->debug_step },
-        "Next\tShift+Alt+N" => sub { $self->debug_next },
-        "Return\tShift+Alt+R" => sub { $self->debug_return },
-        "Eval\tShift+Alt+E" => sub { $self->debug_eval },
+        "Running code..." => [
+            "Continue\tShift+Alt+C" => sub { $self->debug_continue },
+            "Step\tShift+Alt+S" => sub { $self->debug_step },
+            "Next\tShift+Alt+N" => sub { $self->debug_next },
+            "Return\tShift+Alt+R" => sub { $self->debug_return },
+        ],
+        "Breakpoint/Watches..." => [
+            "Breakpoint\tShift+Alt+B" => sub { $self->debug_breakpoint },
+            "Breakpoint (conditional)\tCtrl+Shift+Alt+B" => sub { $self->debug_breakpoint_cond },
+            "Watch" => sub { $self->debug_watch },
+        ],
+        "Evaluate expression\tShift+Alt+E" => sub { $self->debug_eval },
     ]
 }
 
@@ -78,7 +87,7 @@ sub start_debugger {
     $ebug->load;
 
     $self->{debugger} = $ebug;
-    $self->mark_current_line;
+    $self->update_view;
 }
 
 sub stop_debugger {
@@ -91,10 +100,28 @@ sub stop_debugger {
         return;
     }
 
+    $main->message("Debugger stopped");
+
     delete $self->{debugger};
 }
 
 sub debug_step {
+    my $self = shift;
+    my $ebug = $self->{debugger};
+    my $main = Padre->ide->wx->main;
+    my $file = $main->current->document->filename;
+
+    unless (defined $ebug) {
+        $main->error("Debugger isn't running");
+        return;
+    }
+
+    $ebug->step;
+    $ebug->step until $file eq $ebug->filename;
+    $self->update_view;
+}
+
+sub debug_continue {
     my $self = shift;
     my $ebug = $self->{debugger};
     my $main = Padre->ide->wx->main;
@@ -104,8 +131,8 @@ sub debug_step {
         return;
     }
 
-    $ebug->step;
-    $self->mark_current_line;
+    $ebug->run;
+    $self->update_view;
 }
 
 sub debug_next {
@@ -119,7 +146,7 @@ sub debug_next {
     }
 
     $ebug->next;
-    $self->mark_current_line;
+    $self->update_view;
 }
 
 sub debug_return {
@@ -133,7 +160,7 @@ sub debug_return {
     }
 
     $ebug->return;
-    $self->mark_current_line;
+    $self->update_view;
 }
 
 sub debug_eval {
@@ -148,37 +175,112 @@ sub debug_eval {
 
     my $eval = $main->prompt("Evaluate in debugger", "Please type expression to evaluate", "MY_DEBUGGER_EVAL");
 
-    print STDERR "Debugger going to evaluate: $eval\n";
-
     if ($eval) {
         my $yaml = $ebug->yaml($eval);
-        print STDERR $yaml;
+        $main->message($yaml, "Result");
     }
-
-    print STDERR "...\n";
 
     return 1;
 }
 
+sub debug_breakpoint {
+    my $self = shift;
+    my $cond = shift;
+    my $ebug = $self->{debugger};
+    my $main = Padre->ide->wx->main;
+
+    unless (defined $ebug) {
+        $main->error("Debugger isn't running");
+        return;
+    }
+
+    my $editor = Padre::Current->editor;
+    my $line   = $editor->LineFromPosition($editor->GetCurrentPos);
+    my $break  = $ebug->break_point($line + 1, $cond) - 1;
+
+    # Make marker:
+    my $red    = Wx::Colour->new("red");
+
+    $editor->MarkerDefine( MarkBreakPoint(), Wx::wxSTC_MARK_ARROW, $red, $red );
+    $editor->MarkerAdd( $break, MarkBreakPoint() );
+
+    return 1;
+}
+    
+sub debug_breakpoint_cond {
+    my $self = shift;
+    my $ebug = $self->{debugger};
+    my $main = Padre->ide->wx->main;
+
+    unless (defined $ebug) {
+        $main->error("Debugger isn't running");
+        return;
+    }
+
+    my $cond = $main->prompt("Conditional breakpoint", "Please type condition to break on", "MY_DEBUGGER_BREAK");
+
+    $self->debug_breakpoint($cond);
+}
+
+sub debug_watch {
+    my $self = shift;
+    my $ebug = $self->{debugger};
+
+    my $main = Padre->ide->wx->main;
+
+    unless (defined $ebug) {
+        $main->error("Debugger isn't running");
+        return;
+    }
+
+    my $watch = $main->prompt("Watch expression", "Please type expression to watch", "MY_DEBUGGER_WATCH");
+
+    require Padre::Plugin::Debugger::Wx::Watches;
+
+    $self->{watchbox} ||= Padre::Plugin::Debugger::Wx::Watches->new($main);
+    $self->{watches}  ||= {};
+
+    $self->{watches}->{$watch} = $ebug->eval($watch);
+
+    $ebug->watch_point($watch);
+    $main->bottom->show( $self->{watchbox} );
+
+    $self->update_view();
+}
+
 # Internal functions
 
-sub MarkCurrent { 42 };
+sub MarkBreakPoint { 17 }
 
-sub mark_current_line {
+sub update_view {
     my $self   = shift;
     my $ebug   = $self->{debugger};
-    my $line   = $ebug->line() - 1;
     my $editor = Padre::Current->editor;
-    my $syntax = Padre->ide->wx->main->syntax;
+    my $main = Padre->ide->wx->main;
+    return unless $ebug;
+    
+    if ( $ebug->finished ) {
+        $self->stop_debugger;
+        return;
+    }
 
+    # Move to current line
+    my $line   = $ebug->line() - 1;
     $editor->goto_line_centerize($line);
 
-    $syntax->clear;
+    # Update watches
+    if ($self->{watchbox}) {
+        $self->{watches}->{$_} = $ebug->eval($_) for keys %{ $self->{watches} };
 
-    my $green = Wx::Colour->new("green");
-    $editor->MarkerDefine( MarkCurrent(), Wx::wxSTC_MARK_SMALLRECT, $green, $green );
+        $self->{watchbox}->clear;
+        $self->{watchbox}->AppendText( YAML::Dump( $self->{watches} ) );
+    }
 
-    $editor->MarkerAdd( $line, MarkCurrent() );
+    # Update output
+    my($stdout, $stderr) = $ebug->output;
+    $main->output->clear;               # We get the full output each time...
+    $main->output->AppendText($stdout);
+    $main->output->AppendText($stderr);
 
     return 1;
 }
@@ -189,7 +291,7 @@ __END__
 
 =head1 NAME
 
-Padre::Plugin::Debugger - send code on a nopaste website from padre
+Padre::Plugin::Debugger - Debug Perl code from Padre editor
 
 
 
@@ -218,25 +320,11 @@ your bug as I make changes.
 
 =head1 SEE ALSO
 
-Our git repository is located at L<git://github.com/pmakholm/padre-plugin-debugger.git>,
-and can be browsed at L<http://github.com/pmakholm/padre-plugin-debugger/tree/master>.
+L<Devel::ebug> - The backend debugger.
 
+L<http://github.com/pmakholm/padre-plugin-debugger/tree/master> - Git repository
 
-You can also look for information on this module at:
-
-=over 4
-
-=item * AnnoCPAN: Annotated CPAN documentation
-
-L<http://annocpan.org/dist/Padre-Plugin-Debugger>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/Padre-Plugin-Debugger>
-
-=item * Open bugs
-
-L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=Padre-Plugin-Debugger>
+L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=Padre-Plugin-Debugger> - Bug tracking
 
 =back
 
