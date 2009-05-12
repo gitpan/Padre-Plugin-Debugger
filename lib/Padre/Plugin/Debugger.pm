@@ -13,7 +13,7 @@ use strict;
 use warnings;
 
 use File::Basename qw(fileparse);
-use File::Spec::Functions qw(catfile);
+use File::Spec::Functions qw(catfile abs2rel rel2abs);
 use YAML;
 
 use Padre::Wx;
@@ -21,7 +21,7 @@ use Padre::Plugin;
 
 use parent qw(Padre::Plugin);
 
-our $VERSION = "0.1";
+our $VERSION = "0.2";
 
 # -- Padre API, see Padre::Plugin
 
@@ -49,6 +49,7 @@ sub menu_plugins_simple {
             "Watch" => sub { $self->debug_watch },
         ],
         "Evaluate expression\tShift+Alt+E" => sub { $self->debug_eval },
+        "Show stacktrace" => sub { $self->show_stacktrace },
     ]
 }
 
@@ -61,7 +62,7 @@ sub show_about {
     my $about = Wx::AboutDialogInfo->new;
     $about->SetName("Padre::Plugin::Debugger");
     $about->SetDescription( <<"END_MESSAGE" );
-Initial debugger plugin for Padre
+Padre Perl5 Debugger
 END_MESSAGE
     $about->SetVersion( $VERSION );
 
@@ -116,9 +117,7 @@ sub debug_step {
         return;
     }
 
-    $ebug->step;
-    $ebug->step until $file eq $ebug->filename;
-    $self->update_view;
+    do { $ebug->step } until $self->update_view;
 }
 
 sub debug_continue {
@@ -179,7 +178,6 @@ sub debug_eval {
         my $yaml = $ebug->yaml($eval);
         $main->message($yaml, "Result");
     }
-
     return 1;
 }
 
@@ -188,6 +186,9 @@ sub debug_breakpoint {
     my $cond = shift;
     my $ebug = $self->{debugger};
     my $main = Padre->ide->wx->main;
+    my $file = $main->current->document->filename;
+
+    $file = $self->resolve_file( $file );
 
     unless (defined $ebug) {
         $main->error("Debugger isn't running");
@@ -196,7 +197,7 @@ sub debug_breakpoint {
 
     my $editor = Padre::Current->editor;
     my $line   = $editor->LineFromPosition($editor->GetCurrentPos);
-    my $break  = $ebug->break_point($line + 1, $cond) - 1;
+    my $break  = $ebug->break_point($file, $line + 1, $cond) - 1;
 
     # Make marker:
     my $red    = Wx::Colour->new("red");
@@ -248,9 +249,68 @@ sub debug_watch {
     $self->update_view();
 }
 
+sub show_stacktrace {
+    my $self = shift;
+    my $ebug = $self->{debugger};
+
+    my $main = Padre->ide->wx->main;
+
+    unless (defined $ebug) {
+        $main->error("Debugger isn't running");
+        return;
+    }
+
+    require Padre::Plugin::Debugger::Wx::StackTrace;
+
+    $self->{stacktrace} ||= Padre::Plugin::Debugger::Wx::StackTrace->new($main);
+    $self->{stacktrace}->set_debugger($self);
+
+    $main->right->show( $self->{stacktrace} );
+
+    $self->update_view();
+}
+
+sub goto_frame {
+    my $self = shift;
+    my $line = shift;
+
+    my @stack = $self->{debugger}->stack_trace;
+    my $frame = $stack[$line];
+
+    my $main = Padre->ide->wx->main;
+    my $id   = $main->find_editor_of_file( $frame->filename );
+    unless ( defined $id ) {
+        my $load = Wx::MessageBox(
+	    "Unknown file, Should I load it?",
+            "Padre", 
+            Wx::wxYES_NO | Wx::wxCENTRE, 
+            $main
+        );
+        return if $load == Wx::wxNO;
+
+        $id = $main->setup_editor( $frame->filename );
+    }
+
+    $main->on_nth_pane($id);
+    Padre::Current->editor->goto_line_centerize($frame->line - 1);
+
+    return 1;
+}
+
 # Internal functions
 
 sub MarkBreakPoint { 17 }
+
+sub resolve_file {
+    my $self = shift;
+    my $file = shift;
+    my $ebug = $self->{debugger};
+
+    my $base  = $ebug->eval("require Cwd; Cwd::cwd;");
+    my %known = map { rel2abs($_, $base) => $_ } $ebug->filenames;
+
+    return $known{$file};
+}
 
 sub update_view {
     my $self   = shift;
@@ -261,7 +321,16 @@ sub update_view {
     
     if ( $ebug->finished ) {
         $self->stop_debugger;
-        return;
+        return 1;
+    }
+
+    # Try to change to right file
+    if ( $main->current->document->filename ne $ebug->filename ) {
+        my $id = $main->find_editor_of_file( $ebug->filename );
+	return unless defined $id; # Autoload files?
+
+	$main->on_nth_pane($id);
+        $editor = Padre::Current->editor;
     }
 
     # Move to current line
@@ -274,6 +343,18 @@ sub update_view {
 
         $self->{watchbox}->clear;
         $self->{watchbox}->AppendText( YAML::Dump( $self->{watches} ) );
+    }
+
+    # Update stack trace
+    if ($self->{stacktrace}) {
+        $self->{stacktrace}->DeleteAllItems;
+
+        my @stack = $ebug->stack_trace;
+
+        $self->{stacktrace}->InsertStringItem( 0, $_->filename. "::" .  $_->line)
+            for reverse @stack;
+        
+        $self->{stacktrace}->SetColumnWidth( 0, Wx::wxLIST_AUTOSIZE );
     }
 
     # Update output
