@@ -19,9 +19,11 @@ use YAML;
 use Padre::Wx;
 use Padre::Plugin;
 
+use Padre::Plugin::Debugger::Wx::Menu;
+
 use parent qw(Padre::Plugin);
 
-our $VERSION = "0.2";
+our $VERSION = "0.3";
 
 # -- Padre API, see Padre::Plugin
 
@@ -31,29 +33,38 @@ sub padre_interfaces {
     "Padre::Plugin" => 0.28,
 }
 
-sub menu_plugins_simple {
+sub menu_plugins {
     my $self = shift;
-    return $self->plugin_name => [
-        "About" => sub { $self->show_about },
-        "Start debugger" => sub { $self->start_debugger },
-        "Stop debugger" => sub { $self->stop_debugger },
-        "Running code..." => [
-            "Continue\tShift+Alt+C" => sub { $self->debug_continue },
-            "Step\tShift+Alt+S" => sub { $self->debug_step },
-            "Next\tShift+Alt+N" => sub { $self->debug_next },
-            "Return\tShift+Alt+R" => sub { $self->debug_return },
-        ],
-        "Breakpoint/Watches..." => [
-            "Breakpoint\tShift+Alt+B" => sub { $self->debug_breakpoint },
-            "Breakpoint (conditional)\tCtrl+Shift+Alt+B" => sub { $self->debug_breakpoint_cond },
-            "Watch" => sub { $self->debug_watch },
-        ],
-        "Evaluate expression\tShift+Alt+E" => sub { $self->debug_eval },
-        "Show stacktrace" => sub { $self->show_stacktrace },
-    ]
+    my $main = shift;
+
+    $self->{menu} ||= Padre::Plugin::Debugger::Wx::Menu->new($main,$self);
+    $self->{menu}->refresh();
+
+    return ( $self->plugin_name => $self->{menu}->wx );
+}
+
+sub plugin_enable {
+    my $self = shift;
+    my $main = Padre->ide->wx->main;
+
+    $self->{config} = $self->config_read() || {};
+
+    $self->{menu} ||= Padre::Plugin::Debugger::Wx::Menu->new($main,$self);
+    $self->{menu}->refresh();
+
+    $self->show_stacktrace( $self->{config}->{stacktrace} );
+    $self->show_watches( $self->{config}->{watchbox} );
+
+    return 1;
 }
 
 # Public functions
+
+sub is_running {
+    my $self = shift;
+
+    return exists $self->{debugger};
+}
 
 sub show_about {
     my $self = shift;
@@ -82,9 +93,37 @@ sub start_debugger {
         return;
     }
 
-    require Devel::ebug;
-    my $ebug = Devel::ebug->new();
-    $ebug->program($doc->filename);
+    # Copied from Document/Perl.pm
+    my $config = Padre->ide->config;
+
+    # Run with the same Perl that launched Padre
+    # TODO: get preferred Perl from configuration
+    my $file = $doc->filename;
+    my $perl = Padre->perl_interpreter;
+
+    # Set default arguments
+    my %run_args = (
+        interpreter => $config->run_interpreter_args_default,
+        script      => $config->run_script_args_default,
+    );
+
+    # Overwrite default arguments with the ones preferred for given document
+    foreach my $arg ( keys %run_args ) {
+        my $type = "run_${arg}_args_" . File::Basename::fileparse($file);
+        $run_args{$arg} = Padre::DB::History->previous($type) if Padre::DB::History->previous($type);
+    }
+
+    my $dir = File::Basename::dirname($file);
+    chdir $dir;
+    
+    require Devel::ebug::Padre;
+    my $ebug = Devel::ebug::Padre->new();
+
+    $ebug->interpreter($perl);
+    $ebug->interpreter_args($run_args{interpreter});
+    $ebug->program($file);
+    $ebug->program_args($run_args{script});
+
     $ebug->load;
 
     $self->{debugger} = $ebug;
@@ -188,7 +227,7 @@ sub debug_breakpoint {
     my $main = Padre->ide->wx->main;
     my $file = $main->current->document->filename;
 
-    $file = $self->resolve_file( $file );
+    $file = $self->ebug_filename( $file );
 
     unless (defined $ebug) {
         $main->error("Debugger isn't running");
@@ -236,38 +275,71 @@ sub debug_watch {
 
     my $watch = $main->prompt("Watch expression", "Please type expression to watch", "MY_DEBUGGER_WATCH");
 
-    require Padre::Plugin::Debugger::Wx::Watches;
-
-    $self->{watchbox} ||= Padre::Plugin::Debugger::Wx::Watches->new($main);
-    $self->{watches}  ||= {};
-
     $self->{watches}->{$watch} = $ebug->eval($watch);
-
     $ebug->watch_point($watch);
-    $main->bottom->show( $self->{watchbox} );
 
     $self->update_view();
 }
 
-sub show_stacktrace {
+sub show_watches {
     my $self = shift;
-    my $ebug = $self->{debugger};
-
+    my $on   = @_ ? $_[0] ? 1 : 0 : 1;
     my $main = Padre->ide->wx->main;
 
-    unless (defined $ebug) {
-        $main->error("Debugger isn't running");
-        return;
+    # Create pane
+    require Padre::Plugin::Debugger::Wx::Watches;
+    $self->{watchbox} ||=
+        Padre::Plugin::Debugger::Wx::Watches->new($main);
+    $self->{watchbox}->set_debugger($self);
+
+    # Update view
+    unless ( $on == $self->{menu}->{view_watches}->IsChecked ) {
+        $self->{menu}->{view_watches}->Check($on);
+    }
+    $self->{config}->{watchbox} = $on;
+
+    if ($on) {
+        $main->bottom->show( $self->{watchbox} );
+    } else {
+        $main->bottom->hide( $self->{watchbox} );
     }
 
-    require Padre::Plugin::Debugger::Wx::StackTrace;
+    $main->aui->Update;
 
-    $self->{stacktrace} ||= Padre::Plugin::Debugger::Wx::StackTrace->new($main);
+    $self->config_write( $self->{config} );
+    $self->update_view() if $self->is_running;
+
+    return 1;
+}
+sub show_stacktrace {
+    my $self = shift;
+    my $on   = @_ ? $_[0] ? 1 : 0 : 1;
+    my $main = Padre->ide->wx->main;
+
+    # Create pane
+    require Padre::Plugin::Debugger::Wx::StackTrace;
+    $self->{stacktrace} ||=
+        Padre::Plugin::Debugger::Wx::StackTrace->new($main);
     $self->{stacktrace}->set_debugger($self);
 
-    $main->right->show( $self->{stacktrace} );
+    # Update view
+    unless ( $on == $self->{menu}->{view_stacktrace}->IsChecked ) {
+        $self->{menu}->{view_stacktrace}->Check($on);
+    }
+    $self->{config}->{stacktrace} = $on;
 
-    $self->update_view();
+    if ($on) {
+        $main->right->show( $self->{stacktrace} );
+    } else {
+        $main->right->hide( $self->{stacktrace} );
+    }
+
+    $main->aui->Update;
+
+    $self->config_write( $self->{config} );
+    $self->update_view() if $self->is_running;
+
+    return 1;
 }
 
 sub goto_frame {
@@ -276,9 +348,10 @@ sub goto_frame {
 
     my @stack = $self->{debugger}->stack_trace;
     my $frame = $stack[$line];
+    my $file  = $self->padre_filename( $frame->filename );
 
     my $main = Padre->ide->wx->main;
-    my $id   = $main->find_editor_of_file( $frame->filename );
+    my $id   = $main->find_editor_of_file( $file );
     unless ( defined $id ) {
         my $load = Wx::MessageBox(
 	    "Unknown file, Should I load it?",
@@ -288,7 +361,7 @@ sub goto_frame {
         );
         return if $load == Wx::wxNO;
 
-        $id = $main->setup_editor( $frame->filename );
+        $id = $main->setup_editor( $file );
     }
 
     $main->on_nth_pane($id);
@@ -301,13 +374,24 @@ sub goto_frame {
 
 sub MarkBreakPoint { 17 }
 
-sub resolve_file {
+sub ebug_filename {
     my $self = shift;
     my $file = shift;
     my $ebug = $self->{debugger};
 
     my $base  = $ebug->eval("require Cwd; Cwd::cwd;");
     my %known = map { rel2abs($_, $base) => $_ } $ebug->filenames;
+
+    return $known{$file};
+}
+
+sub padre_filename {
+    my $self = shift;
+    my $file = shift;
+    my $ebug = $self->{debugger};
+
+    my $base  = $ebug->eval("require Cwd; Cwd::cwd;");
+    my %known = map { $_ => rel2abs($_, $base) } $ebug->filenames;
 
     return $known{$file};
 }
@@ -321,12 +405,15 @@ sub update_view {
     
     if ( $ebug->finished ) {
         $self->stop_debugger;
+        $self->{menu}->refresh();
         return 1;
     }
 
+
     # Try to change to right file
-    if ( $main->current->document->filename ne $ebug->filename ) {
-        my $id = $main->find_editor_of_file( $ebug->filename );
+    my $file = $self->padre_filename( $ebug->filename );
+    if ( $main->current->document->filename ne $file ) {
+        my $id = $main->find_editor_of_file( $file );
 	return unless defined $id; # Autoload files?
 
 	$main->on_nth_pane($id);
@@ -362,6 +449,9 @@ sub update_view {
     $main->output->clear;               # We get the full output each time...
     $main->output->AppendText($stdout);
     $main->output->AppendText($stderr);
+
+    # Refresh menu
+    $self->{menu}->refresh();
 
     return 1;
 }
